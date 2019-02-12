@@ -17,14 +17,21 @@
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <unordered_map>
+#include <chrono>
 
 #pragma comment(lib, "Ws2_32.lib")
 
 #define DEFAULT_PORT "27015"
 #define DEFAULT_BUFLEN 512
 
-int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string request, comms* messagePasser,
-		cache* shared_cache) {
+int chunkString(std::string str,char* buf,int buflen) {
+	int endbuflen = str.size() < buflen ? str.size() : buflen;
+	str.copy(buf, endbuflen);
+	return endbuflen;
+}
+
+int forward_connection(SOCKET ClientSocket, std::string request, std::string hostname,
+	std::string protocol, comms* messagePasser, cache* shared_cache, bool dont_cache) {
 	int recvbuflen = DEFAULT_BUFLEN;
 	char recvbuf[DEFAULT_BUFLEN];
 
@@ -40,40 +47,26 @@ int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string 
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_TCP;
 
-	std::string header = packetInfo.prefix().str();
-	std::string frst_field = header.substr(0, header.find("\r\n"));
-	std::vector<std::string> components = split(frst_field," ");
-	std::vector<std::string> targetHost = split(components[1], "//");
-	std::string hostname = targetHost[1].substr(0,targetHost[1].size()-1);
-	std::string protocol = targetHost[0].substr(0, targetHost[0].size() - 1);
 
-	//printf("host: %s  protocol: %s \n",hostname.c_str(), protocol.c_str());
 
-	//RAII auto unlock of mutex using lock_gaurd
+	std::string response = "";
+	bool cacheExists = false;
+	int bandwidth = 0;
+	auto start = std::chrono::high_resolution_clock::now();
+
+	//Check cache for result
 	{
-		std::lock_guard<std::mutex> g(messagePasser->mutex);
-		messagePasser->queue.push(request);
-		messagePasser->status = true;
-		messagePasser->condVar.notify_all();
-	}
-
-	bool banStatus = false;
-	//RAII auto unlock of mutex using lock_gaurd
-	{
-		std::lock_guard<std::mutex> g(messagePasser->mutex);
-		for (const auto& url : messagePasser->banned_urls) {
-			if (url == hostname) {
-				messagePasser->queue.push("Banned url:" + hostname);
-				messagePasser->status = true;
-				messagePasser->condVar.notify_all();
-				banStatus = true;
-			}
+		std::lock_guard<std::mutex> g(shared_cache->mutex);
+		std::unordered_map<std::string, std::string> cache = shared_cache->cache;
+		auto cachedData = cache.find(hostname);
+		if (cachedData != cache.end()) {
+			response = cachedData -> second;
+			cacheExists = true;
+			//printf("\n\nKido riddo mido!\n\n");
 		}
 	}
 
-
-	if (!banStatus) {
-
+	if (!cacheExists) {
 		iResult = getaddrinfo(hostname.c_str(), protocol.c_str(), &hints, &result);
 		if (iResult != 0) {
 			printf("getaddrinfo failed: %d\n", iResult);
@@ -119,6 +112,7 @@ int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string 
 			closesocket(ConnectSocket);
 			return 1;
 		}
+		bandwidth += iResult;
 
 		// shutdown the connection for sending since no more data will be sent
 		// the client can still use the ConnectSocket for receiving data
@@ -129,8 +123,6 @@ int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string 
 			return 1;
 		}
 
-		std::string response = "";
-		int iSendResult;
 		// Receive data until the server closes the connection
 		do {
 			iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
@@ -142,38 +134,52 @@ int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string 
 			else
 				printf("recv failed: %d\n", WSAGetLastError());
 
+			bandwidth += iResult;
 			response += std::string(recvbuf, iResult);
-
-			// Send the result from server to client
-			iSendResult = send(ClientSocket, recvbuf, iResult, 0);
-			if (iSendResult == SOCKET_ERROR) {
-				printf("send failed: %d\n", WSAGetLastError());
-				closesocket(ClientSocket);
-				return 1;
-			}
-
-			printf("Bytes sent: %d\n", iSendResult);
 		} while (iResult > 0);
 
+	}
+		
+	auto end = std::chrono::high_resolution_clock::now();
+	auto time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-		//RAII auto unlock of mutex using lock_gaurd
-		{
-			std::lock_guard<std::mutex> g(messagePasser->mutex);
-			messagePasser->queue.push(response);
-			messagePasser->status = true;
-			messagePasser->condVar.notify_all();
-		}
-		// shutdown the send half of the connection since no more data will be sent
-		iResult = shutdown(ConnectSocket, SD_SEND);
-		if (iResult == SOCKET_ERROR) {
-			printf("shutdown failed: %d\n", WSAGetLastError());
-			closesocket(ConnectSocket);
-			return 1;
-		}
 
+	//Print the response and time taken to management console
+	{
+		std::lock_guard<std::mutex> g(messagePasser->mutex);
+		messagePasser->queue.push("\n Time taken = " + std::to_string(time) + "\nBandwidth used = " 
+			+ std::to_string(bandwidth));
+		messagePasser->queue.push(response);
+		messagePasser->status = true;
+		messagePasser->condVar.notify_all();
 	}
 
-	// shutdown the send half of the connection since no more data will be sent
+	//conditionally update cache
+	if(!cacheExists)
+	{
+
+		std::lock_guard<std::mutex> g(shared_cache->mutex);
+		shared_cache->cache[hostname] = response;
+		//printf("Cache exists...search for it, I left it all at 'that place'!\n");
+	}
+
+	int iSendResult;
+	do
+	{
+		iResult = chunkString(response, recvbuf, recvbuflen);
+		// Send the result from server to client
+		iSendResult = send(ClientSocket, recvbuf, iResult, 0);
+		if (iSendResult == SOCKET_ERROR) {
+			printf("send failed: %d\n", WSAGetLastError());
+			closesocket(ClientSocket);
+			return 1;
+		}
+		response = response.substr(iResult);
+	} while (iResult > 0);
+
+	//printf("Bytes sent: %d\n", iSendResult);
+
+	// shutdown the send conn to client
 	iResult = shutdown(ClientSocket, SD_SEND);
 	if (iResult == SOCKET_ERROR) {
 		printf("shutdown failed: %d\n", WSAGetLastError());
@@ -187,6 +193,99 @@ int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string 
 	return 0;
 }
 
+/*	Handles all interaction with the header of the initial client request
+	Only does any network interaction of closing client socket if the requested url is banned.
+	All other network interaction left up to children and parent functions
+	Also calls appropriate function to handle any further required interactions
+*/
+int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string request, comms* messagePasser,
+	cache* shared_cache) {
+	//Pass header of message to be printed on management console
+	{
+			std::lock_guard<std::mutex> g(messagePasser->mutex);
+			messagePasser->queue.push(request);
+			messagePasser->status = true;
+			messagePasser->condVar.notify_all();
+	}
+	std::string header = packetInfo.prefix().str();
+	std::string frst_field = header.substr(0, header.find("\r\n"));
+	std::string request_type = split(frst_field, " ")[0];
+	std::string host_field = header.substr(header.find("Host"), header.find("\r\n"));
+	std::string hostname = split(split(host_field, " ")[1],"\r\n")[0];
+	std::string port_alias = "http";
+	bool websock = false;
+	bool dont_cache = false;
+	int err_status = -1;
+
+	//In case the Host is specified as an addresss and port instead
+	std::vector<std::string> full_path = split(hostname, ":");
+	if (full_path.size() == 2) {
+		hostname = full_path[0];
+		port_alias = full_path[1];
+	}
+	//In case the path is given as an IPv6 address and Port instead
+	else if (full_path.size() > 2 && hostname.find("[") != std::string::npos
+		&& hostname.find("]") != std::string::npos) {
+		hostname = hostname.substr(hostname.find("[")+1, hostname.find("]")-1);
+		port_alias = hostname.substr(hostname.find("]") + 1);
+	}
+
+	bool isBanned = false;
+	{
+		std::lock_guard<std::mutex> g(messagePasser->mutex);
+		for (const auto& url : messagePasser->banned_urls) {
+			if (url == hostname) {
+				messagePasser->queue.push("Banned url:" + hostname);
+				messagePasser->status = true;
+				messagePasser->condVar.notify_all();
+				isBanned = true;
+			}
+		}
+	}
+	if (isBanned) {
+		int iResult;
+		// shutdown the send conn to client
+		iResult = shutdown(ClientSocket, SD_SEND);
+		if (iResult == SOCKET_ERROR) {
+			printf("shutdown failed: %d\n", WSAGetLastError());
+		}
+
+		// cleanup
+		closesocket(ClientSocket);
+		return 1;
+	}
+
+	if (header.find("Upgrade: WebSocket") != std::string::npos) {
+		websock = true;
+	}
+
+	if (request_type == "GET") {
+		err_status = forward_connection(ClientSocket, request, hostname, port_alias, 
+			messagePasser, shared_cache,dont_cache);
+	}
+	else if (request_type == "CONNECT") {
+		
+	}
+	//For all other types of requests just do a simple no cache request transfer
+	else {
+		dont_cache = true;
+	}
+
+	/*Debug printing
+	{
+		std::lock_guard<std::mutex> g(messagePasser->mutex);
+		messagePasser->queue.push(hostname);
+		messagePasser->queue.push(port_alias);
+		messagePasser->queue.push(request_type);
+		messagePasser->status = true;
+		messagePasser->condVar.notify_all();
+	}
+	*/
+	return err_status;
+}
+
+/*	receives initial request from client and then passes the request for processing 
+*/
 int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_cache) {
 
 	char recvbuf[DEFAULT_BUFLEN];
@@ -213,7 +312,7 @@ int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_c
 						// Optional garbage data removal code
 						int garbageDataLength = header_match.suffix().length() - content_length;
 						std::string realReponse = response.substr(0, response.size() - garbageDataLength);
-						return forward_connection(ClientSocket, header_match, response, messagePasser, shared_cache);
+						return parseHttpHeader(ClientSocket, header_match, response, messagePasser, shared_cache);
 					}
 					else {
 						//debug code ... usually means more data still expected
@@ -223,7 +322,7 @@ int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_c
 				}
 				else {
 					// no Content length and end of header indicates no body..I think
-					return forward_connection(ClientSocket, header_match, response, messagePasser, shared_cache);
+					return parseHttpHeader(ClientSocket, header_match, response, messagePasser, shared_cache);
 				}
 			}
 		
@@ -240,7 +339,7 @@ int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_c
 	return 1;
 }
 
-
+//Listens to main port and creates new thread to handle any new requests
 int main(){
 	comms messagePasser;
 	messagePasser.status = false;
