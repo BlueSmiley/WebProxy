@@ -1,3 +1,2 @@
 ﻿  proxy.cpp
-c:\users\tonpr\desktop\telecomms\urlblocker\urlblocker\proxy.cpp(164): warning C4101: 'iSendResult': unreferenced local variable
   UrlBlocker.vcxproj -> C:\Users\tonpr\Desktop\Telecomms\UrlBlocker\Debug\UrlBlocker.exe

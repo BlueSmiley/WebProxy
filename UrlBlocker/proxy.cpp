@@ -16,13 +16,15 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <stdio.h>
+#include <unordered_map>
 
 #pragma comment(lib, "Ws2_32.lib")
 
 #define DEFAULT_PORT "27015"
 #define DEFAULT_BUFLEN 512
 
-int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string request) {
+int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string request, comms* messagePasser,
+		cache* shared_cache) {
 	int recvbuflen = DEFAULT_BUFLEN;
 	char recvbuf[DEFAULT_BUFLEN];
 
@@ -45,155 +47,184 @@ int forward_connection(SOCKET ClientSocket, std::smatch packetInfo, std::string 
 	std::string hostname = targetHost[1].substr(0,targetHost[1].size()-1);
 	std::string protocol = targetHost[0].substr(0, targetHost[0].size() - 1);
 
-	printf("hostis: %s  protocol is %s ",hostname.c_str(), protocol.c_str());
-	iResult = getaddrinfo(hostname.c_str(), protocol.c_str(), &hints, &result);
-	//iResult = getaddrinfo("www.google.com", "80", &hints, &result);
-	if (iResult != 0) {
-		printf("getaddrinfo failed: %d\n", iResult);
-		WSACleanup();
-		return 1;
-	}
-	// Attempt to connect to the first address returned by
-	// the call to getaddrinfo
-	ptr = result;
+	//printf("host: %s  protocol: %s \n",hostname.c_str(), protocol.c_str());
 
-	// Create a SOCKET for connecting to server
-	ConnectSocket = socket(ptr->ai_family, ptr->ai_socktype,
-		ptr->ai_protocol);
-
-	if (ConnectSocket == INVALID_SOCKET) {
-		printf("Error at socket(): %ld\n", WSAGetLastError());
-		freeaddrinfo(result);
-		WSACleanup();
-		return 1;
+	//RAII auto unlock of mutex using lock_gaurd
+	{
+		std::lock_guard<std::mutex> g(messagePasser->mutex);
+		messagePasser->queue.push(request);
+		messagePasser->status = true;
+		messagePasser->condVar.notify_all();
 	}
 
-	// Connect to server.
-	iResult = connect(ConnectSocket, ptr->ai_addr, (int)ptr->ai_addrlen);
-	if (iResult == SOCKET_ERROR) {
-		closesocket(ConnectSocket);
-		ConnectSocket = INVALID_SOCKET;
-	}
-
-	// Should really try the next address returned by getaddrinfo
-	// if the connect call failed
-	// But for this simple example we just free the resources
-	// returned by getaddrinfo and print an error message
-
-	freeaddrinfo(result);
-
-	if (ConnectSocket == INVALID_SOCKET) {
-		printf("Unable to connect to server!\n");
-		WSACleanup();
-		return 1;
-	}
-
-	iResult = send(ConnectSocket, request.c_str(), request.size(), 0);
-	if (iResult == SOCKET_ERROR) {
-		printf("send failed: %d\n", WSAGetLastError());
-		closesocket(ConnectSocket);
-		WSACleanup();
-		return 1;
-	}
-
-	printf("Bytes Sent: %ld\n", iResult);
-
-	// shutdown the connection for sending since no more data will be sent
-	// the client can still use the ConnectSocket for receiving data
-	iResult = shutdown(ConnectSocket, SD_SEND);
-	if (iResult == SOCKET_ERROR) {
-		printf("shutdown failed: %d\n", WSAGetLastError());
-		closesocket(ConnectSocket);
-		WSACleanup();
-		return 1;
-	}
-
-	std::string response = "";
-	int iSendResult;
-	// Receive data until the server closes the connection
-	do {
-		iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
-		if (iResult > 0)
-			printf("Bytes received: %d\n", iResult);
-		else if (iResult == 0) {
-			printf("Connection closed\n");
-			printf(response.c_str());
+	bool banStatus = false;
+	//RAII auto unlock of mutex using lock_gaurd
+	{
+		std::lock_guard<std::mutex> g(messagePasser->mutex);
+		for (const auto& url : messagePasser->banned_urls) {
+			if (url == hostname) {
+				messagePasser->queue.push("Banned url:" + hostname);
+				messagePasser->status = true;
+				messagePasser->condVar.notify_all();
+				banStatus = true;
+			}
 		}
-		else
-			printf("recv failed: %d\n", WSAGetLastError());
-		response += std::string(recvbuf);
+	}
 
-		// Echo the buffer back to the sender
-		iSendResult = send(ClientSocket, recvbuf, recvbuflen, 0);
-		if (iSendResult == SOCKET_ERROR) {
-			printf("send failed: %d\n", WSAGetLastError());
-			closesocket(ClientSocket);
-			WSACleanup();
+
+	if (!banStatus) {
+
+		iResult = getaddrinfo(hostname.c_str(), protocol.c_str(), &hints, &result);
+		if (iResult != 0) {
+			printf("getaddrinfo failed: %d\n", iResult);
 			return 1;
 		}
-		printf("Bytes sent: %d\n", iSendResult);
-	} while (iResult > 0);
+		// Attempt to connect to the first address returned by
+		// the call to getaddrinfo
+		ptr = result;
 
-	/*int iSendResult;
-	// Echo the buffer back to the sender
-	iSendResult = send(ClientSocket, response.c_str(), response.size(), 0);
-	if (iSendResult == SOCKET_ERROR) {
-		printf("send failed: %d\n", WSAGetLastError());
-		closesocket(ClientSocket);
-		WSACleanup();
-		return 1;
+		// Create a SOCKET for connecting to server
+		ConnectSocket = socket(ptr->ai_family, ptr->ai_socktype,
+			ptr->ai_protocol);
+
+		if (ConnectSocket == INVALID_SOCKET) {
+			printf("Error at socket(): %ld\n", WSAGetLastError());
+			freeaddrinfo(result);
+			return 1;
+		}
+
+		// Connect to server.
+		iResult = connect(ConnectSocket, ptr->ai_addr, (int)ptr->ai_addrlen);
+		if (iResult == SOCKET_ERROR) {
+			closesocket(ConnectSocket);
+			ConnectSocket = INVALID_SOCKET;
+		}
+
+		// Should really try the next address returned by getaddrinfo
+		// if the connect call failed
+		// But for this simple example we just free the resources
+		// returned by getaddrinfo and print an error message
+
+		freeaddrinfo(result);
+
+		if (ConnectSocket == INVALID_SOCKET) {
+			printf("Unable to connect to server!\n");
+			return 1;
+		}
+
+		//todo split up into smaller chunks rather than in one go
+		iResult = send(ConnectSocket, request.c_str(), request.size(), 0);
+		if (iResult == SOCKET_ERROR) {
+			printf("send failed: %d\n", WSAGetLastError());
+			closesocket(ConnectSocket);
+			return 1;
+		}
+
+		// shutdown the connection for sending since no more data will be sent
+		// the client can still use the ConnectSocket for receiving data
+		iResult = shutdown(ConnectSocket, SD_SEND);
+		if (iResult == SOCKET_ERROR) {
+			printf("shutdown failed: %d\n", WSAGetLastError());
+			closesocket(ConnectSocket);
+			return 1;
+		}
+
+		std::string response = "";
+		int iSendResult;
+		// Receive data until the server closes the connection
+		do {
+			iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
+			if (iResult > 0)
+				printf("Bytes received: %d\n", iResult);
+			else if (iResult == 0) {
+				printf("Connection closed\n");
+			}
+			else
+				printf("recv failed: %d\n", WSAGetLastError());
+
+			response += std::string(recvbuf, iResult);
+
+			// Send the result from server to client
+			iSendResult = send(ClientSocket, recvbuf, iResult, 0);
+			if (iSendResult == SOCKET_ERROR) {
+				printf("send failed: %d\n", WSAGetLastError());
+				closesocket(ClientSocket);
+				return 1;
+			}
+
+			printf("Bytes sent: %d\n", iSendResult);
+		} while (iResult > 0);
+
+
+		//RAII auto unlock of mutex using lock_gaurd
+		{
+			std::lock_guard<std::mutex> g(messagePasser->mutex);
+			messagePasser->queue.push(response);
+			messagePasser->status = true;
+			messagePasser->condVar.notify_all();
+		}
+		// shutdown the send half of the connection since no more data will be sent
+		iResult = shutdown(ConnectSocket, SD_SEND);
+		if (iResult == SOCKET_ERROR) {
+			printf("shutdown failed: %d\n", WSAGetLastError());
+			closesocket(ConnectSocket);
+			return 1;
+		}
+
 	}
-	printf("Bytes sent: %d\n", iSendResult);*/
 
 	// shutdown the send half of the connection since no more data will be sent
-	iResult = shutdown(ConnectSocket, SD_SEND);
+	iResult = shutdown(ClientSocket, SD_SEND);
 	if (iResult == SOCKET_ERROR) {
 		printf("shutdown failed: %d\n", WSAGetLastError());
-		closesocket(ConnectSocket);
-		WSACleanup();
+		closesocket(ClientSocket);
 		return 1;
 	}
+
+	// cleanup
+	closesocket(ClientSocket);
 
 	return 0;
 }
 
-int connectionHandler(SOCKET ClientSocket) {
+int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_cache) {
 
 	char recvbuf[DEFAULT_BUFLEN];
-	int iResult;
-	int  iSendResult;
 	int recvbuflen = DEFAULT_BUFLEN;
+	int iResult;
 	std::string response = "";
 	std::regex header_regex("\r\n\r\n");
 	std::smatch header_match;
 	std::regex regex("Content-Length: \\d\\r\\n");
 	std::smatch match;
+
 	// Receive until the peer shuts down the connection
 	do {
 
 		iResult = recv(ClientSocket, recvbuf, recvbuflen, 0);
 		if (iResult > 0) {
-			printf("Bytes received: %d\n", iResult);
-			response += std::string(recvbuf);
-
-			std::cout << response << std::endl;
+			response += std::string(recvbuf,iResult);
 			if (std::regex_search(response, header_match, header_regex)) {
 				std::string header = header_match.prefix().str();
 				if (std::regex_search(header, match, regex)) {
 					int content_length = std::stoi(match.str().substr(16, match.str().length()));
-					printf("%d", content_length);
+					//printf("%d", content_length);
 					if (header_match.suffix().length() >= content_length) {
-						forward_connection(ClientSocket, header_match, response);
+						// Optional garbage data removal code
+						int garbageDataLength = header_match.suffix().length() - content_length;
+						std::string realReponse = response.substr(0, response.size() - garbageDataLength);
+						return forward_connection(ClientSocket, header_match, response, messagePasser, shared_cache);
 					}
 					else {
-						printf("Packet data:%d vs expected length:%d",
-							header_match.suffix().length(), content_length);
+						//debug code ... usually means more data still expected
+						//printf("Packet data:%d vs expected length:%d",
+						//	header_match.suffix().length(), content_length);
 					}
 				}
 				else {
-					forward_connection(ClientSocket, header_match, response);
+					// no Content length and end of header indicates no body..I think
+					return forward_connection(ClientSocket, header_match, response, messagePasser, shared_cache);
 				}
-				printf("found it\n");
 			}
 		
 		}
@@ -202,32 +233,25 @@ int connectionHandler(SOCKET ClientSocket) {
 		else {
 			printf("recv failed: %d\n", WSAGetLastError());
 			closesocket(ClientSocket);
-			WSACleanup();
 			return 1;
 		}
 
 	} while (iResult > 0);
-
-	// shutdown the send half of the connection since no more data will be sent
-	iResult = shutdown(ClientSocket, SD_SEND);
-	if (iResult == SOCKET_ERROR) {
-		printf("shutdown failed: %d\n", WSAGetLastError());
-		closesocket(ClientSocket);
-		WSACleanup();
-		return 1;
-	}
-
-	// cleanup
-	closesocket(ClientSocket);
-	WSACleanup();
-	return 0;
+	return 1;
 }
 
 
 int main(){
-	WSADATA wsaData;
+	comms messagePasser;
+	messagePasser.status = false;
+	cache shared_cache;
+	std::thread commsThread(console, &messagePasser);
+	//commsThread.join();
 
+	WSADATA wsaData;
+	struct addrinfo *result = NULL, *ptr = NULL, hints;
 	int iResult;
+	SOCKET ListenSocket = INVALID_SOCKET;
 
 	// Initialize Winsock
 	iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -236,7 +260,6 @@ int main(){
 		return 1;
 	}
 
-	struct addrinfo *result = NULL, *ptr = NULL, hints;
 
 	ZeroMemory(&hints, sizeof(hints));
 	hints.ai_family = AF_INET;
@@ -252,7 +275,6 @@ int main(){
 		return 1;
 	}
 
-	SOCKET ListenSocket = INVALID_SOCKET;
 	ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
 	if (ListenSocket == INVALID_SOCKET) {
 		printf("Error at socket(): %ld\n", WSAGetLastError());
@@ -289,7 +311,7 @@ int main(){
 			WSACleanup();
 			return 1;
 		}
-		std::thread t1(connectionHandler,ClientSocket);
+		std::thread t1(connectionHandler,ClientSocket,&messagePasser, &shared_cache);
 		t1.detach();
 	}
 	
