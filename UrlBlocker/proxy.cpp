@@ -24,38 +24,28 @@
 #define DEFAULT_PORT "27015"
 #define DEFAULT_BUFLEN 512
 
+/*
+Chunk string into buffer returning the length of the data in the buffer
+*/
 int chunkString(std::string str,char* buf,int buflen) {
 	int endbuflen = str.size() < buflen ? str.size() : buflen;
 	str.copy(buf, endbuflen);
 	return endbuflen;
 }
 
-int forward_connection(SOCKET ClientSocket, std::string request, std::string hostname,
-	std::string protocol, comms* messagePasser, cache* shared_cache, bool dont_cache) {
+int data_request(SOCKET ClientSocket,SOCKET ServerSocket, std::string hostname,std::string request,
+	comms* messagePasser, cache* shared_cache, bool dont_cache) {
 	int recvbuflen = DEFAULT_BUFLEN;
 	char recvbuf[DEFAULT_BUFLEN];
-
 	int iResult;
-
-	SOCKET ConnectSocket = INVALID_SOCKET;
-	struct addrinfo *result = NULL,
-					*ptr = NULL,
-					hints;
-
-	ZeroMemory(&hints, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-
-
-
 	std::string response = "";
 	bool cacheExists = false;
 	int bandwidth = 0;
+
 	auto start = std::chrono::high_resolution_clock::now();
 
 	//Check cache for result
-	{
+	if(!dont_cache){
 		std::lock_guard<std::mutex> g(shared_cache->mutex);
 		std::unordered_map<std::string, std::string> cache = shared_cache->cache;
 		auto cachedData = cache.find(hostname);
@@ -67,65 +57,28 @@ int forward_connection(SOCKET ClientSocket, std::string request, std::string hos
 	}
 
 	if (!cacheExists) {
-		iResult = getaddrinfo(hostname.c_str(), protocol.c_str(), &hints, &result);
-		if (iResult != 0) {
-			printf("getaddrinfo failed: %d\n", iResult);
-			return 1;
-		}
-		// Attempt to connect to the first address returned by
-		// the call to getaddrinfo
-		ptr = result;
-
-		// Create a SOCKET for connecting to server
-		ConnectSocket = socket(ptr->ai_family, ptr->ai_socktype,
-			ptr->ai_protocol);
-
-		if (ConnectSocket == INVALID_SOCKET) {
-			printf("Error at socket(): %ld\n", WSAGetLastError());
-			freeaddrinfo(result);
-			return 1;
-		}
-
-		// Connect to server.
-		iResult = connect(ConnectSocket, ptr->ai_addr, (int)ptr->ai_addrlen);
-		if (iResult == SOCKET_ERROR) {
-			closesocket(ConnectSocket);
-			ConnectSocket = INVALID_SOCKET;
-		}
-
-		// Should really try the next address returned by getaddrinfo
-		// if the connect call failed
-		// But for this simple example we just free the resources
-		// returned by getaddrinfo and print an error message
-
-		freeaddrinfo(result);
-
-		if (ConnectSocket == INVALID_SOCKET) {
-			printf("Unable to connect to server!\n");
-			return 1;
-		}
 
 		//todo split up into smaller chunks rather than in one go
-		iResult = send(ConnectSocket, request.c_str(), request.size(), 0);
+		iResult = send(ServerSocket, request.c_str(), request.size(), 0);
 		if (iResult == SOCKET_ERROR) {
 			printf("send failed: %d\n", WSAGetLastError());
-			closesocket(ConnectSocket);
+			closesocket(ServerSocket);
 			return 1;
 		}
 		bandwidth += iResult;
 
 		// shutdown the connection for sending since no more data will be sent
 		// the client can still use the ConnectSocket for receiving data
-		iResult = shutdown(ConnectSocket, SD_SEND);
+		iResult = shutdown(ServerSocket, SD_SEND);
 		if (iResult == SOCKET_ERROR) {
 			printf("shutdown failed: %d\n", WSAGetLastError());
-			closesocket(ConnectSocket);
+			closesocket(ServerSocket);
 			return 1;
 		}
 
 		// Receive data until the server closes the connection
 		do {
-			iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
+			iResult = recv(ServerSocket, recvbuf, recvbuflen, 0);
 			if (iResult > 0)
 				printf("Bytes received: %d\n", iResult);
 			else if (iResult == 0) {
@@ -155,7 +108,7 @@ int forward_connection(SOCKET ClientSocket, std::string request, std::string hos
 	}
 
 	//conditionally update cache
-	if(!cacheExists)
+	if(!cacheExists && !dont_cache)
 	{
 
 		std::lock_guard<std::mutex> g(shared_cache->mutex);
@@ -193,9 +146,155 @@ int forward_connection(SOCKET ClientSocket, std::string request, std::string hos
 	return 0;
 }
 
+/* 
+	Duplex connection between server and client without processing any of it.
+*/
+int data_connection(SOCKET ClientSocket, SOCKET ServerSocket, comms* messagePasser) {
+
+	int recvbuflen = DEFAULT_BUFLEN;
+	char recvbuf[DEFAULT_BUFLEN];
+	int iResult;
+
+	std::string connect_response = "HTTP/1.1 200 Connection established\r\n\r\n";
+	iResult = send(ClientSocket, connect_response.c_str(), connect_response.size(), 0);
+	if (iResult == SOCKET_ERROR) {
+		printf("send failed: %d\n", WSAGetLastError());
+		closesocket(ClientSocket);
+	}
+
+	//assume we can always write to a socket for now
+	fd_set readFDs;
+	//Initialise blocking time to 1 secs
+	timeval time;
+	time.tv_sec = 1 * 60;
+	time.tv_usec = 0;
+	bool error = false;
+	bool clientClosed = false;
+	bool serverClosed = false;
+	while (!error && !(serverClosed && clientClosed)) {
+		//Associate both sets with the read set
+		FD_ZERO(&readFDs);
+		if(!clientClosed)
+			FD_SET(ClientSocket, &readFDs);
+		if(!serverClosed)
+			FD_SET(ServerSocket, &readFDs);
+		//Block for given time
+		iResult = select(0, &readFDs, NULL, NULL,&time);
+		if (iResult == SOCKET_ERROR) {
+			printf("select failed: %d\n", WSAGetLastError());
+			error = true;
+		}
+		else if (iResult == 0) {
+			//timeout so end exchange
+			printf("timeout");
+			error = true;
+		}
+		else {
+			if (!clientClosed && FD_ISSET(ClientSocket, &readFDs)) {
+				iResult = recv(ClientSocket, recvbuf, recvbuflen, 0);
+				if (iResult > 0) {
+					printf("Bytes received: %d\n", iResult);
+					iResult = send(ServerSocket, recvbuf, iResult, 0);
+					if (iResult == SOCKET_ERROR) {
+						printf("send failed: %d\n", WSAGetLastError());
+						error = true;
+					}
+				}
+				else if (iResult == 0) {
+					printf("Connection closed by client\n");
+					clientClosed = true;
+				}
+				else {
+					printf("recv failed waiting for client: %d\n", WSAGetLastError());
+					error = true;
+				}
+			}
+			if (!serverClosed && FD_ISSET(ServerSocket, &readFDs)) {
+				iResult = recv(ServerSocket, recvbuf, recvbuflen, 0);
+				if (iResult > 0) {
+					printf("Bytes received: %d\n", iResult);
+					iResult = send(ClientSocket, recvbuf, iResult, 0);
+					if (iResult == SOCKET_ERROR) {
+						printf("send failed: %d\n", WSAGetLastError());
+						error = true;
+					}
+				}
+				else if (iResult == 0) {
+					printf("Connection closed by server\n");
+					serverClosed = true;
+				}
+				else {
+					printf("recv failed waiting for server: %d\n", WSAGetLastError());
+					error = true;
+				}
+			}
+		}
+	}
+	closesocket(ClientSocket);
+	closesocket(ServerSocket);
+	printf("Gracefulll termination");
+	return 0;
+}
+
+/* Establish connection to given server
+*/
+SOCKET establishServerConnection(std::string hostname, std::string port_alias) {
+	bool serv_status = true;
+	SOCKET ServerSocket = INVALID_SOCKET;
+	int iResult;
+	struct addrinfo *result = NULL,
+		*ptr = NULL,
+		hints;
+
+	ZeroMemory(&hints, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+
+	iResult = getaddrinfo(hostname.c_str(), port_alias.c_str(), &hints, &result);
+	if (iResult != 0) {
+		printf("getaddrinfo failed: %d\n", iResult);
+		ServerSocket = INVALID_SOCKET;
+		return ServerSocket;
+	}
+	// Attempt to connect to the first address returned by
+	// the call to getaddrinfo
+	ptr = result;
+
+	// Create a SOCKET for connecting to server
+	ServerSocket = socket(ptr->ai_family, ptr->ai_socktype,
+		ptr->ai_protocol);
+
+	if (ServerSocket == INVALID_SOCKET) {
+		printf("Error at socket(): %ld\n", WSAGetLastError());
+		freeaddrinfo(result);
+		ServerSocket = INVALID_SOCKET;
+		return ServerSocket;
+	}
+
+	// Connect to server.
+	iResult = connect(ServerSocket, ptr->ai_addr, (int)ptr->ai_addrlen);
+	if (iResult == SOCKET_ERROR) {
+		closesocket(ServerSocket);
+		ServerSocket = INVALID_SOCKET;
+	}
+
+	// Should really try the next address returned by getaddrinfo
+	// if the connect call failed
+	// But for this simple example we just free the resources
+	// returned by getaddrinfo and print an error message
+
+	freeaddrinfo(result);
+
+	if (ServerSocket == INVALID_SOCKET) {
+		printf("Unable to connect to server!\n");
+		return ServerSocket;
+	}
+	return ServerSocket;
+}
+
 /*	Handles all interaction with the header of the initial client request
-	Only does any network interaction of closing client socket if the requested url is banned.
-	All other network interaction left up to children and parent functions
+	Closes client socket and terminates connection if the requested url is banned.
 	Also calls appropriate function to handle any further required interactions
 */
 int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string request, comms* messagePasser,
@@ -216,6 +315,8 @@ int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string req
 	bool websock = false;
 	bool dont_cache = false;
 	int err_status = -1;
+	int iResult;
+	SOCKET ServerSocket;
 
 	//In case the Host is specified as an addresss and port instead
 	std::vector<std::string> full_path = split(hostname, ":");
@@ -242,33 +343,56 @@ int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string req
 			}
 		}
 	}
-	if (isBanned) {
-		int iResult;
-		// shutdown the send conn to client
-		iResult = shutdown(ClientSocket, SD_SEND);
-		if (iResult == SOCKET_ERROR) {
-			printf("shutdown failed: %d\n", WSAGetLastError());
+	if (!isBanned) {
+		ServerSocket = establishServerConnection(hostname, port_alias);
+		if (ServerSocket == INVALID_SOCKET) {
+			closesocket(ClientSocket);
+			return err_status;
 		}
-
+	}
+	if (isBanned) {
 		// cleanup
 		closesocket(ClientSocket);
-		return 1;
+		return err_status;
 	}
 
-	if (header.find("Upgrade: WebSocket") != std::string::npos) {
-		websock = true;
+	if (header.find("Connection: Upgrade") != std::string::npos) {
+		if (header.find("Upgrade: websocket") != std::string::npos) {
+			printf("Found websock");
+			websock = true;
+		}
 	}
 
-	if (request_type == "GET") {
-		err_status = forward_connection(ClientSocket, request, hostname, port_alias, 
-			messagePasser, shared_cache,dont_cache);
+	if (request_type == "GET") {	   
+		if (websock) {
+			iResult = send(ServerSocket, request.c_str(), request.size(), 0);
+			if (iResult == SOCKET_ERROR) {
+				printf("send failed: %d\n", WSAGetLastError());
+				closesocket(ServerSocket);
+				closesocket(ClientSocket);
+				return err_status;
+			}
+			err_status = data_connection(ClientSocket, ServerSocket, messagePasser);
+		}
+		else {
+			err_status = data_request(ClientSocket, ServerSocket, hostname,
+				request, messagePasser, shared_cache, dont_cache);
+		}
 	}
 	else if (request_type == "CONNECT") {
-		
+		err_status = data_connection(ClientSocket, ServerSocket, messagePasser);
 	}
-	//For all other types of requests just do a simple no cache request transfer
+	//For all other types of requests just do a simple no cache data duplex
 	else {
 		dont_cache = true;
+		iResult = send(ServerSocket, request.c_str(), request.size(), 0);
+		if (iResult == SOCKET_ERROR) {
+			printf("send failed: %d\n", WSAGetLastError());
+			closesocket(ServerSocket);
+			closesocket(ClientSocket);
+			return err_status;
+		}
+		err_status = data_connection(ClientSocket,ServerSocket,messagePasser);
 	}
 
 	/*Debug printing
@@ -339,7 +463,9 @@ int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_c
 	return 1;
 }
 
-//Listens to main port and creates new thread to handle any new requests
+/*
+Listens to main port and creates new thread to handle any new requests
+*/
 int main(){
 	comms messagePasser;
 	messagePasser.status = false;
