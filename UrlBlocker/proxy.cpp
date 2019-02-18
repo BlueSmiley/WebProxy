@@ -24,6 +24,48 @@
 #define DEFAULT_PORT "27015"
 #define DEFAULT_BUFLEN 512
 
+struct cache_opts {
+	bool is_public = false;
+	bool wont_cache = false;
+	int validTime = 0;
+};
+
+int handleCache(cache* shared_cache, std::string request, comms* messagePasser, cache_opts *opts) {
+	std::string header = request.substr(0,request.find("\r\n\r\n"));
+	int startCacheField = header.find("Cache-Control:");
+	int endCacheField = (header.substr(header.find("Cache-Control:"))).find("\r\n");
+
+	if (startCacheField != std::string::npos && endCacheField != std::string::npos) {
+		std::string cc_fields = header.substr(startCacheField, (endCacheField - startCacheField));
+		if (cc_fields.find("private") != std::string::npos) {
+			opts->wont_cache = true;
+		}
+		if (cc_fields.find("public") != std::string::npos) {
+			opts->is_public = true;
+		}
+		if (cc_fields.find("no-store") != std::string::npos) {
+			opts->wont_cache = true;
+		}
+		if (cc_fields.find("max-age") != std::string::npos) {
+			opts -> validTime = std::stoi(std::regex_replace(header, std::regex("[^0-9]*max-age=([0-9]+).*"), std::string("\\1")));
+		}
+		if (cc_fields.find("s-maxage") != std::string::npos) {
+			opts->validTime = std::stoi(std::regex_replace(header, std::regex("[^0-9]*s-maxage=([0-9]+).*"), std::string("\\1")));
+		}
+
+	}
+	else {
+		startCacheField = header.find("Expires:");
+		endCacheField = (header.substr(header.find("Expires:"))).find("\r\n");
+		if(startCacheField != std::string::npos && endCacheField != std::string::npos) {
+			std::string expiry_field = header.substr(startCacheField, (endCacheField - startCacheField));
+			std::string expiry_date = expiry_field.substr(7);
+			//Il do rest of processing eventually maybe later.
+		}
+	}
+	return 0;
+}
+
 /*
 Chunk string into buffer returning the length of the data in the buffer
 */
