@@ -1,3 +1,3 @@
 ﻿  proxy.cpp
-c:\users\tonpr\desktop\telecomms\urlblocker\urlblocker\proxy.cpp(31): warning C4018: '<': signed/unsigned mismatch
+c:\users\tonpr\desktop\telecomms\urlblocker\urlblocker\proxy.cpp(112): warning C4018: '<': signed/unsigned mismatch
   UrlBlocker.vcxproj -> C:\Users\tonpr\Desktop\Telecomms\UrlBlocker\Debug\UrlBlocker.exe

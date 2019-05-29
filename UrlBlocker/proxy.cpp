@@ -24,46 +24,85 @@
 #define DEFAULT_PORT "27015"
 #define DEFAULT_BUFLEN 512
 
-struct cache_opts {
-	bool is_public = false;
-	bool wont_cache = false;
-	int validTime = 0;
-};
-
-int handleCache(cache* shared_cache, std::string request, comms* messagePasser, cache_opts *opts) {
+/*
+Handles all the cache options
+*/
+int handleCache(std::string request, cache_opts *opts) {
 	std::string header = request.substr(0,request.find("\r\n\r\n"));
 	int startCacheField = header.find("Cache-Control:");
-	int endCacheField = (header.substr(header.find("Cache-Control:"))).find("\r\n");
+	int endCacheField;
+	if (startCacheField != std::string::npos) {
+		endCacheField = (header.substr(header.find("Cache-Control:"))).find("\r\n");
+		if (endCacheField != std::string::npos) {
+			std::string cc_fields = header.substr(startCacheField, (endCacheField - startCacheField));
+			if (cc_fields.find("private") != std::string::npos) {
+				opts->wont_cache = true;
+			}
+			if (cc_fields.find("public") != std::string::npos) {
+				opts->is_public = true;
+			}
+			if (cc_fields.find("no-store") != std::string::npos) {
+				opts->wont_cache = true;
+			}
+			if (cc_fields.find("max-age") != std::string::npos) {
+				opts->ts_given = true;
+				std::regex rgx(".*max-age=([0-9]+).*");
+				std::smatch match;
+				if (std::regex_search(cc_fields, match, rgx)) {
+					int duration = std::stoi(match[1]);
+					opts->validTime = std::chrono::system_clock::now() += std::chrono::seconds(duration);
+				}
+			}
+			if (cc_fields.find("s-maxage") != std::string::npos) {
+				opts->ts_given = true;
+				std::regex rgx(".*s-maxage=([0-9]+).*");
+				std::smatch match;
+				if (std::regex_search(cc_fields, match, rgx)) {
+					int duration = std::stoi(match[1]);
+					opts->validTime = std::chrono::system_clock::now() += std::chrono::seconds(duration);
+				}
+			}
+			if (cc_fields.find("ETag") != std::string::npos) {
 
-	if (startCacheField != std::string::npos && endCacheField != std::string::npos) {
-		std::string cc_fields = header.substr(startCacheField, (endCacheField - startCacheField));
-		if (cc_fields.find("private") != std::string::npos) {
-			opts->wont_cache = true;
-		}
-		if (cc_fields.find("public") != std::string::npos) {
-			opts->is_public = true;
-		}
-		if (cc_fields.find("no-store") != std::string::npos) {
-			opts->wont_cache = true;
-		}
-		if (cc_fields.find("max-age") != std::string::npos) {
-			opts -> validTime = std::stoi(std::regex_replace(header, std::regex("[^0-9]*max-age=([0-9]+).*"), std::string("\\1")));
-		}
-		if (cc_fields.find("s-maxage") != std::string::npos) {
-			opts->validTime = std::stoi(std::regex_replace(header, std::regex("[^0-9]*s-maxage=([0-9]+).*"), std::string("\\1")));
-		}
+				int start = cc_fields.find("\"", cc_fields.find("ETag"));
+				int end = cc_fields.find("\"", start + 1);
+				opts->etag = cc_fields.substr(start, end);
+				opts->etag_exists = true;
+			}
+			if (cc_fields.find("no-cache") != std::string::npos && opts->etag_exists) {
+				opts->revalidate = true;
+			}
+			if (cc_fields.find("must-revalidate") != std::string::npos && opts->etag_exists) {
+				opts->revalidate = true;
+			}
 
+		}
 	}
 	else {
 		startCacheField = header.find("Expires:");
-		endCacheField = (header.substr(header.find("Expires:"))).find("\r\n");
-		if(startCacheField != std::string::npos && endCacheField != std::string::npos) {
-			std::string expiry_field = header.substr(startCacheField, (endCacheField - startCacheField));
-			std::string expiry_date = expiry_field.substr(7);
-			//Il do rest of processing eventually maybe later.
+		if (startCacheField != std::string::npos) {
+			endCacheField = (header.substr(header.find("Expires:"))).find("\r\n");
+			if (endCacheField != std::string::npos) {
+				std::string expiry_field = header.substr(startCacheField, (endCacheField - startCacheField));
+				std::string expiry_date = expiry_field.substr(7);
+				//Il do rest of processing eventually maybe later.
+			}
 		}
 	}
 	return 0;
+}
+
+/*
+	prints things to console
+*/
+void commsPrint(comms* messagePasser, std::string request) {
+	//Pass header of message to be printed on management console
+	{
+		std::lock_guard<std::mutex> g(messagePasser->mutex);
+		messagePasser->queue.push(request);
+		messagePasser->status = true;
+		messagePasser->condVar.notify_all();
+	}
 }
 
 /*
@@ -75,6 +114,20 @@ int chunkString(std::string str,char* buf,int buflen) {
 	return endbuflen;
 }
 
+/*
+Insert a header into a request, meant to check for etags but not really used yet
+*/
+std::string insertHeader(std::string request, std::string headerField) {
+	int headerEnd = request.find("\r\n\r\n");
+	std::string header = request.substr(0, headerEnd);
+	std::string body = request.substr(headerEnd);
+	std::string new_header = header + headerField;
+	return (new_header + body);
+}
+
+/*
+Sents a get request to server and return s result. Caches results when applicable
+*/
 int data_request(SOCKET ClientSocket,SOCKET ServerSocket, std::string hostname,std::string request,
 	comms* messagePasser, cache* shared_cache, bool dont_cache) {
 	int recvbuflen = DEFAULT_BUFLEN;
@@ -89,12 +142,36 @@ int data_request(SOCKET ClientSocket,SOCKET ServerSocket, std::string hostname,s
 	//Check cache for result
 	if(!dont_cache){
 		std::lock_guard<std::mutex> g(shared_cache->mutex);
-		std::unordered_map<std::string, std::string> cache = shared_cache->cache;
-		auto cachedData = cache.find(hostname);
+		std::unordered_map<std::string, cache_opts> cache = shared_cache->cache;
+		auto cachedData = cache.find(request.substr(0,request.find("\r\n")));
 		if (cachedData != cache.end()) {
-			response = cachedData -> second;
-			cacheExists = true;
-			//printf("\n\nKido riddo mido!\n\n");
+			cache_opts cacheStatus = cachedData->second;
+			if (cacheStatus.is_public) {
+				response = cacheStatus.cacheData;
+				cacheExists = true;
+			}
+			else if (cacheStatus.wont_cache) {
+				cacheExists = false;
+			}
+			else if (cacheStatus.ts_given) {
+				if (std::chrono::system_clock::now() > cacheStatus.validTime) {
+					cacheStatus.revalidate = true;
+				}
+				else {
+					response = cacheStatus.cacheData;
+					cacheExists = true;
+				}
+			}
+			//lets just cache by default if we don't need to revalidate
+			else if(!cacheStatus.revalidate){
+				response = cacheStatus.cacheData;
+				cacheExists = true;
+			}
+			//code to revalidate using etag
+			if (!cacheStatus.wont_cache && cacheStatus.etag_exists && cacheStatus.revalidate) {
+				request = insertHeader(request, "If-None-Match: " + cacheStatus.etag);
+				cacheExists = false;
+			}
 		}
 	}
 
@@ -140,21 +217,17 @@ int data_request(SOCKET ClientSocket,SOCKET ServerSocket, std::string hostname,s
 
 
 	//Print the response and time taken to management console
-	{
-		std::lock_guard<std::mutex> g(messagePasser->mutex);
-		messagePasser->queue.push("\n Time taken = " + std::to_string(time) + "\nBandwidth used = " 
-			+ std::to_string(bandwidth));
-		messagePasser->queue.push(response);
-		messagePasser->status = true;
-		messagePasser->condVar.notify_all();
-	}
+	commsPrint(messagePasser, response);
+	commsPrint(messagePasser, "\n Time taken = " + std::to_string(time) + "\nBandwidth used = "
+		+ std::to_string(bandwidth));
 
 	//conditionally update cache
 	if(!cacheExists && !dont_cache)
 	{
 
 		std::lock_guard<std::mutex> g(shared_cache->mutex);
-		shared_cache->cache[hostname] = response;
+		handleCache(response, &(shared_cache->cache[request.substr(0, request.find("\r\n"))]));
+		shared_cache->cache[request.substr(0, request.find("\r\n"))].cacheData = response;
 		//printf("Cache exists...search for it, I left it all at 'that place'!\n");
 	}
 
@@ -191,17 +264,20 @@ int data_request(SOCKET ClientSocket,SOCKET ServerSocket, std::string hostname,s
 /* 
 	Duplex connection between server and client without processing any of it.
 */
-int data_connection(SOCKET ClientSocket, SOCKET ServerSocket, comms* messagePasser) {
+int data_connection(SOCKET ClientSocket, SOCKET ServerSocket, comms* messagePasser, bool ishttps) {
 
 	int recvbuflen = DEFAULT_BUFLEN;
 	char recvbuf[DEFAULT_BUFLEN];
 	int iResult;
+	int bytes = 0;
 
-	std::string connect_response = "HTTP/1.1 200 Connection established\r\n\r\n";
-	iResult = send(ClientSocket, connect_response.c_str(), connect_response.size(), 0);
-	if (iResult == SOCKET_ERROR) {
-		printf("send failed: %d\n", WSAGetLastError());
-		closesocket(ClientSocket);
+	if (ishttps) {
+		std::string connect_response = "HTTP/1.1 200 Connection established\r\n\r\n";
+		iResult = send(ClientSocket, connect_response.c_str(), connect_response.size(), 0);
+		if (iResult == SOCKET_ERROR) {
+			printf("send failed: %d\n", WSAGetLastError());
+			closesocket(ClientSocket);
+		}
 	}
 
 	//assume we can always write to a socket for now
@@ -235,12 +311,15 @@ int data_connection(SOCKET ClientSocket, SOCKET ServerSocket, comms* messagePass
 			if (!clientClosed && FD_ISSET(ClientSocket, &readFDs)) {
 				iResult = recv(ClientSocket, recvbuf, recvbuflen, 0);
 				if (iResult > 0) {
-					printf("Bytes received: %d\n", iResult);
+					//printf("Bytes received: %d\n", iResult);
+					bytes += iResult;
 					iResult = send(ServerSocket, recvbuf, iResult, 0);
 					if (iResult == SOCKET_ERROR) {
 						printf("send failed: %d\n", WSAGetLastError());
 						error = true;
 					}
+					else
+						bytes += iResult;
 				}
 				else if (iResult == 0) {
 					printf("Connection closed by client\n");
@@ -254,12 +333,15 @@ int data_connection(SOCKET ClientSocket, SOCKET ServerSocket, comms* messagePass
 			if (!serverClosed && FD_ISSET(ServerSocket, &readFDs)) {
 				iResult = recv(ServerSocket, recvbuf, recvbuflen, 0);
 				if (iResult > 0) {
-					printf("Bytes received: %d\n", iResult);
+					//printf("Bytes received: %d\n", iResult);
+					bytes += iResult;
 					iResult = send(ClientSocket, recvbuf, iResult, 0);
 					if (iResult == SOCKET_ERROR) {
 						printf("send failed: %d\n", WSAGetLastError());
 						error = true;
 					}
+					else
+						bytes += iResult;
 				}
 				else if (iResult == 0) {
 					printf("Connection closed by server\n");
@@ -274,7 +356,7 @@ int data_connection(SOCKET ClientSocket, SOCKET ServerSocket, comms* messagePass
 	}
 	closesocket(ClientSocket);
 	closesocket(ServerSocket);
-	printf("Gracefulll termination");
+	printf("Https Termination. Bytes Transmittes %d\n.",bytes);
 	return 0;
 }
 
@@ -342,12 +424,8 @@ SOCKET establishServerConnection(std::string hostname, std::string port_alias) {
 int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string request, comms* messagePasser,
 	cache* shared_cache) {
 	//Pass header of message to be printed on management console
-	{
-			std::lock_guard<std::mutex> g(messagePasser->mutex);
-			messagePasser->queue.push(request);
-			messagePasser->status = true;
-			messagePasser->condVar.notify_all();
-	}
+	commsPrint(messagePasser, request);
+
 	std::string header = packetInfo.prefix().str();
 	std::string frst_field = header.substr(0, header.find("\r\n"));
 	std::string request_type = split(frst_field, " ")[0];
@@ -414,7 +492,7 @@ int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string req
 				closesocket(ClientSocket);
 				return err_status;
 			}
-			err_status = data_connection(ClientSocket, ServerSocket, messagePasser);
+			err_status = data_connection(ClientSocket, ServerSocket, messagePasser, false);
 		}
 		else {
 			err_status = data_request(ClientSocket, ServerSocket, hostname,
@@ -422,7 +500,7 @@ int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string req
 		}
 	}
 	else if (request_type == "CONNECT") {
-		err_status = data_connection(ClientSocket, ServerSocket, messagePasser);
+		err_status = data_connection(ClientSocket, ServerSocket, messagePasser, true);
 	}
 	//For all other types of requests just do a simple no cache data duplex
 	else {
@@ -434,7 +512,7 @@ int parseHttpHeader(SOCKET ClientSocket, std::smatch packetInfo, std::string req
 			closesocket(ClientSocket);
 			return err_status;
 		}
-		err_status = data_connection(ClientSocket,ServerSocket,messagePasser);
+		err_status = data_connection(ClientSocket,ServerSocket,messagePasser, false);
 	}
 
 	/*Debug printing
@@ -477,8 +555,8 @@ int connectionHandler(SOCKET ClientSocket, comms* messagePasser, cache* shared_c
 					if (header_match.suffix().length() >= content_length) {
 						// Optional garbage data removal code
 						int garbageDataLength = header_match.suffix().length() - content_length;
-						std::string realReponse = response.substr(0, response.size() - garbageDataLength);
-						return parseHttpHeader(ClientSocket, header_match, response, messagePasser, shared_cache);
+						std::string realResponse = response.substr(0, response.size() - garbageDataLength);
+						return parseHttpHeader(ClientSocket, header_match, realResponse, messagePasser, shared_cache);
 					}
 					else {
 						//debug code ... usually means more data still expected
